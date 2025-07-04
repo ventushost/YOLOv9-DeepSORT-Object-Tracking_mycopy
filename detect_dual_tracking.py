@@ -9,6 +9,14 @@ import numpy as np
 from deep_sort_pytorch.utils.parser import get_config
 from deep_sort_pytorch.deep_sort import DeepSort
 from collections import deque
+import pandas as pd
+
+
+import re
+from datetime import datetime, timedelta
+
+tracked_data = []
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLO root directory
 if str(ROOT) not in sys.path:
@@ -177,6 +185,44 @@ def run(
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
     for path, im, im0s, vid_cap, s in dataset:
+        p = Path(path)
+
+        ip_match = re.search(r'camip=(\d+\.\d+\.\d+\.\d+)', p.name)
+        if ip_match:
+            cam_ip = ip_match.group(1)
+        else:
+            raise ValueError(
+                f"❌ Keine Kamera-IP im Videonamen '{p.name}' gefunden.\n"
+                "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
+            )
+
+        # 🕒 Start-Zeitstempel aus dem Dateinamen extrahieren
+        ts_match = re.search(r'date=(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d+)', p.name)
+        if ts_match:
+            start_time_str = ts_match.group(1)
+            start_time = datetime.strptime(start_time_str, "%Y-%m-%d_%H-%M-%S.%f")
+        else:
+            raise ValueError(
+                f"❌ Kein Start-Zeitstempel im Videonamen '{p.name}' gefunden.\n"
+                "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
+            )
+        fps = None
+        if vid_cap:
+            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+
+        # Wenn FPS nicht lesbar → Benutzer fragen
+        if not fps or fps <= 1:
+            print(f"⚠️ FPS konnten aus dem Video '{p.name}' nicht automatisch erkannt werden.")
+            while True:
+                try:
+                    fps = float(input("Bitte manuell die FPS-Zahl des Videos eingeben (z. B. 25): "))
+                    if fps > 0:
+                        break
+                    else:
+                        print("❌ Ungültiger Wert. FPS muss > 0 sein.")
+                except ValueError:
+                    print("❌ Eingabe war keine gültige Zahl.")
+
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
             im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
@@ -248,6 +294,40 @@ def run(
                     object_id = outputs[:, -1]
                     draw_boxes(ims, bbox_xyxy, draw_trails, identities, object_id)
 
+                    for j, box in enumerate(bbox_xyxy):
+                        x1, y1, x2, y2 = map(int, box)
+                        width, height = x2 - x1, y2 - y1
+                        center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
+
+                        if start_time:
+                            timestamp = start_time + timedelta(seconds=frame / fps)
+                            timestamp_str = timestamp.isoformat()
+                        else:
+                            timestamp_str = None
+
+
+                        tracked_data.append({
+                            "video_name": p.name,
+                            "frame": int(frame),
+                            "object_id": int(identities[j]),
+                            "class_id": int(object_id[j]),
+                            "class_name": className[int(object_id[j])],
+                            "confidence": float(confs[j]) if j < len(confs) else None,
+                            "x1": x1,
+                            "y1": y1,
+                            "x2": x2,
+                            "y2": y2,
+                            "center_x": center_x,
+                            "center_y": center_y,
+                            "width": width,
+                            "height": height,
+                            "timestamp": timestamp_str,
+                            "camera_ip": cam_ip
+
+                        })
+
+
             # Stream results
             if view_img:
                 if platform.system() == 'Linux' and p not in windows:
@@ -274,6 +354,13 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
+    if tracked_data:
+        df = pd.DataFrame(tracked_data)
+        csv_output_path = save_dir / 'tracking_data.csv'
+        df.to_csv(csv_output_path, index=False)
+        print(f"✅ Trackingdaten gespeichert unter: {csv_output_path}")
+
+    
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
