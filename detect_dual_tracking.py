@@ -299,17 +299,12 @@ def run(
                         # Sicherstellen, dass die Koordinaten im Bildbereich liegen
                         x1 = max(0, x1)
                         y1 = max(0, y1)
-                        x2 = min(frame.shape[1], x2)
-                        y2 = min(frame.shape[0], y2)
-                        
-                        # Region of Interest (ROI) ausschneiden
-                        roi = frame[y1:y2, x1:x2]
-                        
-                        # Blur anwenden (z.B. Gaussian Blur)
+                        x2 = min(im0.shape[1], x2)
+                        y2 = min(im0.shape[0], y2)
+                    
+                        roi = im0[y1:y2, x1:x2]
                         blurred_roi = cv2.GaussianBlur(roi, (35, 35), 0)
-                        
-                        # Die unscharfe Region zurück ins Bild setzen
-                        frame[y1:y2, x1:x2] = blurred_roi
+                        im0[y1:y2, x1:x2] = blurred_roi
                         
                         width, height = x2 - x1, y2 - y1
                         center_x = int((x1 + x2) / 2)
