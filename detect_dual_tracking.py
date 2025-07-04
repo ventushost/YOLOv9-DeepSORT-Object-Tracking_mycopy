@@ -304,7 +304,7 @@ def run(
                     
                         roi = im0[y1:y2, x1:x2]
                         blurred_roi = cv2.GaussianBlur(roi, (35, 35), 0)
-                        im0[y1:y2, x1:x2] = blurred_roi
+                        ims[y1:y2, x1:x2] = blurred_roi
                         
                         width, height = x2 - x1, y2 - y1
                         center_x = int((x1 + x2) / 2)
