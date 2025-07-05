@@ -333,7 +333,9 @@ def run(
                             "width": width,
                             "height": height,
                             "timestamp": timestamp_str,
-                            "camera_ip": cam_ip
+                            "camera_ip": cam_ip,
+                            "frame_width": w,
+                            "frame_height": h
 
                         })
 
