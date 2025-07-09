@@ -361,6 +361,9 @@ def run(
                         fps, w, h = 30, ims.shape[1], ims.shape[0]
                     save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                     vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                # 👉 HIER EINBAUEN:
+                if frame < 3:
+                    ims = cv2.GaussianBlur(ims, (101, 101), 0)
                 vid_writer[i].write(ims)
 
         # Print time (inference-only)
