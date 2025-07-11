@@ -161,7 +161,7 @@ def run(
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
     # Dataloader
-    bs = 1  # batch_size
+    bs = 128  # batch_size
     if webcam:
         view_img = check_imshow(warn=True)
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
@@ -169,214 +169,180 @@ def run(
     elif screenshot:
         dataset = LoadScreenshots(source, img_size=imgsz, stride=stride, auto=pt)
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+        dataset = LoadImages(
+            source,
+            img_size=imgsz,
+            stride=stride,
+            auto=pt,
+            vid_stride=vid_stride,
+            batch_size=bs  # wichtig: Übergabe an neue LoadImages-Klasse
+        )
     vid_path, vid_writer = [None] * bs, [None] * bs
 
+
+    # Run inference
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
-    for path, im, im0s, vid_cap, s in dataset:
-        p = Path(path)
+    for paths, ims, im0s, vid_caps, texts in dataset:
+        for idx, (path, im, im0, vid_cap, s) in enumerate(zip(paths, ims, im0s, vid_caps, texts)):
+            p = Path(path)
 
-        ip_match = re.search(r'camip=(\d+\.\d+\.\d+\.\d+)', p.name)
-        if ip_match:
-            cam_ip = ip_match.group(1)
-        else:
-            raise ValueError(
-                f"❌ Keine Kamera-IP im Videonamen '{p.name}' gefunden.\n"
-                "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
-            )
-
-        # 🕒 Start-Zeitstempel aus dem Dateinamen extrahieren
-        ts_match = re.search(r'date=(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d+)', p.name)
-        if ts_match:
-            start_time_str = ts_match.group(1)
-            start_time = datetime.strptime(start_time_str, "%Y-%m-%d_%H-%M-%S.%f")
-        else:
-            raise ValueError(
-                f"❌ Kein Start-Zeitstempel im Videonamen '{p.name}' gefunden.\n"
-                "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
-            )
-        fps = None
-        if vid_cap:
-            fps = vid_cap.get(cv2.CAP_PROP_FPS)
-
-        # Wenn FPS nicht lesbar → Benutzer fragen
-        if not fps or fps <= 1:
-            print(f"⚠️ FPS konnten aus dem Video '{p.name}' nicht automatisch erkannt werden.")
-            while True:
-                try:
-                    fps = float(input("Bitte manuell die FPS-Zahl des Videos eingeben (z. B. 25): "))
-                    if fps > 0:
-                        break
-                    else:
-                        print("❌ Ungültiger Wert. FPS muss > 0 sein.")
-                except ValueError:
-                    print("❌ Eingabe war keine gültige Zahl.")
-
-        with dt[0]:
-            im = torch.from_numpy(im).to(model.device)
-            im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            if len(im.shape) == 3:
-                im = im[None]  # expand for batch dim
-
-        # Inference
-        with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
-            pred = model(im, augment=augment, visualize=visualize)
-            pred = pred[0]
-
-        # NMS
-        with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
-        # Process predictions
-        for i, det in enumerate(pred):  # per image
-            seen += 1
-            if webcam:  # batch_size >= 1
-                p, im0, frame = path[i], im0s[i].copy(), dataset.count
-                s += f'{i}: '
+            ip_match = re.search(r'camip=(\d+\.\d+\.\d+\.\d+)', p.name)
+            if ip_match:
+                cam_ip = ip_match.group(1)
             else:
-                p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
+                raise ValueError(
+                    f"❌ Keine Kamera-IP im Videonamen '{p.name}' gefunden.\n"
+                    "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
+                )
 
-            p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
-            s += '%gx%g ' % im.shape[2:]  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-            ims = im0.copy()
-            if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+            ts_match = re.search(r'date=(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d+)', p.name)
+            if ts_match:
+                start_time_str = ts_match.group(1)
+                start_time = datetime.strptime(start_time_str, "%Y-%m-%d_%H-%M-%S.%f")
+            else:
+                raise ValueError(
+                    f"❌ Kein Start-Zeitstempel im Videonamen '{p.name}' gefunden.\n"
+                    "Bitte benenne die Datei nach dem Format: camip=IP_date=YYYY-MM-DD_HH-MM-SS.sss.mkv"
+                )
+            fps = None
+            if vid_cap:
+                fps = vid_cap.get(cv2.CAP_PROP_FPS)
 
-                # Print results
-                for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
-                xywh_bboxs = []
-                confs = []
-                oids = []
-                outputs = []
-                # Write results
-                for box in reversed(det):
-                    if len(box) == 6:
-                        *xyxy, conf, cls = box
-                        classNameInt = int(cls)
-                    else:
-                        *xyxy, conf = box
-                        classNameInt = 0  # Standardklasse, falls keine Klassen-ID vorhanden
-                
-                    x1, y1, x2, y2 = xyxy
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                
-                    # Mittelpunkt, Breite, Höhe berechnen
-                    cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-                    bbox_width = abs(x1 - x2)
-                    bbox_height = abs(y1 - y2)
-                    xcycwh = [cx, cy, bbox_width, bbox_height]
-                
-                    xywh_bboxs.append(xcycwh)
-                    conf = math.ceil(conf * 100) / 100
-                    confs.append(conf)
-                    oids.append(classNameInt)
-
-                xywhs = torch.tensor(xywh_bboxs)
-                confss = torch.tensor(confs)
-                outputs = deepsort.update(xywhs, confss, oids, ims)
-                if len(outputs) > 0:
-                    bbox_xyxy = outputs[:, :4]
-                    identities = outputs[:, -2]
-                    object_id = outputs[:, -1]
-                    draw_boxes(ims, bbox_xyxy, draw_trails, identities, object_id)
-
-                    for j, box in enumerate(bbox_xyxy):
-                        x1, y1, x2, y2 = map(int, box)
-                        # Sicherstellen, dass die Koordinaten im Bildbereich liegen
-                        x1 = max(0, x1)
-                        y1 = max(0, y1)
-                        x2 = min(im0.shape[1], x2)
-                        y2 = min(im0.shape[0], y2)
-                    
-                        roi = im0[y1:y2, x1:x2]
-                        blurred_roi = cv2.GaussianBlur(roi, (35, 35), 0)
-                        ims[y1:y2, x1:x2] = blurred_roi
-                        
-                        width, height = x2 - x1, y2 - y1
-                        center_x = int((x1 + x2) / 2)
-                        center_y = int((y1 + y2) / 2)
-
-                        if start_time:
-                            timestamp = start_time + timedelta(seconds=frame / fps)
-                            timestamp_str = timestamp.isoformat()
+            if not fps or fps <= 1:
+                print(f"⚠️ FPS konnten aus dem Video '{p.name}' nicht automatisch erkannt werden.")
+                while True:
+                    try:
+                        fps = float(input("Bitte manuell die FPS-Zahl des Videos eingeben (z. B. 25): "))
+                        if fps > 0:
+                            break
                         else:
-                            timestamp_str = None
+                            print("❌ Ungültiger Wert. FPS muss > 0 sein.")
+                    except ValueError:
+                        print("❌ Eingabe war keine gültige Zahl.")
 
+            with dt[0]:
+                im_tensor = torch.from_numpy(im).to(model.device)
+                im_tensor = im_tensor.half() if model.fp16 else im_tensor.float()
+                im_tensor /= 255
+                if len(im_tensor.shape) == 3:
+                    im_tensor = im_tensor[None]
 
-                        tracked_data.append({
-                            "video_name": p.name,
-                            "frame": int(frame),
-                            "object_id": int(identities[j]),
-                            "class_id": int(object_id[j]),
-                            "class_name": className[int(object_id[j])] if int(object_id[j]) < len(className) else "object",
-                            "confidence": float(confs[j]) if j < len(confs) else None,
-                            "x1": x1,
-                            "y1": y1,
-                            "x2": x2,
-                            "y2": y2,
-                            "center_x": center_x,
-                            "center_y": center_y,
-                            "width": width,
-                            "height": height,
-                            "timestamp": timestamp_str,
-                            "camera_ip": cam_ip,
-                            "frame_width": w,
-                            "frame_height": h
+            with dt[1]:
+                visualize_flag = increment_path(save_dir / p.stem, mkdir=True) if visualize else False
+                pred = model(im_tensor, augment=augment, visualize=visualize_flag)[0]
 
-                        })
+            with dt[2]:
+                pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
+            for i, det in enumerate(pred):
+                seen += 1
+                p, im0, frame = path, im0s[idx].copy(), getattr(dataset, 'frame', 0)
 
-            # Stream results
-            if view_img:
-                if platform.system() == 'Linux' and p not in windows:
-                    windows.append(p)
-                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-                    cv2.resizeWindow(str(p), ims.shape[1], ims.shape[0])
-                cv2.imshow(str(p), ims)
-                cv2.waitKey(1)  # 1 millisecond
-            # Save results (image with detections)
-            if save_img:
-                if vid_path[i] != save_path:  # new video
-                    vid_path[i] = save_path
-                    if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, ims.shape[1], ims.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                # 👉 HIER EINBAUEN:
-                if frame < 3:
-                    ims = cv2.GaussianBlur(ims, (101, 101), 0)
-                vid_writer[i].write(ims)
+                p = Path(p)
+                save_path = str(save_dir / p.name)
+                txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')
+                s += '%gx%g ' % im_tensor.shape[2:]
+                gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
+                ims = im0.copy()
 
-        # Print time (inference-only)
-        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
+                if len(det):
+                    det[:, :4] = scale_boxes(im_tensor.shape[2:], det[:, :4], im0.shape).round()
+
+                    for c in det[:, 5].unique():
+                        n = (det[:, 5] == c).sum()
+                        s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "
+
+                    xywh_bboxs, confs, oids, outputs = [], [], [], []
+                    for box in reversed(det):
+                        if len(box) == 6:
+                            *xyxy, conf, cls = box
+                            classNameInt = int(cls)
+                        else:
+                            *xyxy, conf = box
+                            classNameInt = 0
+
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        w_box, h_box = abs(x1 - x2), abs(y1 - y2)
+
+                        xywh_bboxs.append([cx, cy, w_box, h_box])
+                        confs.append(math.ceil(conf * 100) / 100)
+                        oids.append(classNameInt)
+
+                    xywhs = torch.tensor(xywh_bboxs)
+                    confss = torch.tensor(confs)
+                    outputs = deepsort.update(xywhs, confss, oids, ims)
+                    if len(outputs) > 0:
+                        bbox_xyxy = outputs[:, :4]
+                        identities = outputs[:, -2]
+                        object_id = outputs[:, -1]
+                        draw_boxes(ims, bbox_xyxy, draw_trails, identities, object_id)
+
+                        for j, box in enumerate(bbox_xyxy):
+                            x1, y1, x2, y2 = map(int, box)
+                            x1 = max(0, x1)
+                            y1 = max(0, y1)
+                            x2 = min(im0.shape[1], x2)
+                            y2 = min(im0.shape[0], y2)
+                            roi = im0[y1:y2, x1:x2]
+                            blurred_roi = cv2.GaussianBlur(roi, (35, 35), 0)
+                            ims[y1:y2, x1:x2] = blurred_roi
+                            width, height = x2 - x1, y2 - y1
+                            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                            timestamp = start_time + timedelta(seconds=frame / fps) if start_time else None
+
+                            tracked_data.append({
+                                "video_name": p.name,
+                                "frame": int(frame),
+                                "object_id": int(identities[j]),
+                                "class_id": int(object_id[j]),
+                                "class_name": className[int(object_id[j])] if int(object_id[j]) < len(className) else "object",
+                                "confidence": float(confs[j]) if j < len(confs) else None,
+                                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                                "center_x": center_x, "center_y": center_y,
+                                "width": width, "height": height,
+                                "timestamp": timestamp.isoformat() if timestamp else None,
+                                "camera_ip": cam_ip,
+                                "frame_width": w, "frame_height": h
+                            })
+
+                if view_img:
+                    if platform.system() == 'Linux' and p not in windows:
+                        windows.append(p)
+                        cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                        cv2.resizeWindow(str(p), ims.shape[1], ims.shape[0])
+                    cv2.imshow(str(p), ims)
+                    cv2.waitKey(1)
+
+                if save_img:
+                    if vid_path[idx] != save_path:
+                        vid_path[idx] = save_path
+                        if isinstance(vid_writer[idx], cv2.VideoWriter):
+                            vid_writer[idx].release()
+                        if vid_cap:
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        else:
+                            fps, w, h = 30, ims.shape[1], ims.shape[0]
+                        save_path = str(Path(save_path).with_suffix('.mp4'))
+                        vid_writer[idx] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    if frame < 3:
+                        ims = cv2.GaussianBlur(ims, (101, 101), 0)
+                    vid_writer[idx].write(ims)
+
+            LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
+
     if tracked_data:
         df = pd.DataFrame(tracked_data)
         csv_output_path = save_dir / 'tracking_data.csv'
         df.to_csv(csv_output_path, index=False)
         print(f"✅ Trackingdaten gespeichert unter: {csv_output_path}")
 
-    
     if update:
-        strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        strip_optimizer(weights[0])
 
 
 def parse_opt():
