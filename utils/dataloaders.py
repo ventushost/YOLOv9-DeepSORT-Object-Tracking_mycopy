@@ -236,7 +236,7 @@ class LoadScreenshots:
 
 class LoadImages:
     # YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`
-    def __init__(self, path, img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
+    def __init__(self, path, img_size=640, stride=32, auto=True, transforms=None, vid_stride=1, batch_size=1):
         files = []
         for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
             p = str(Path(p).resolve())
@@ -262,6 +262,9 @@ class LoadImages:
         self.auto = auto
         self.transforms = transforms  # optional
         self.vid_stride = vid_stride  # video frame-rate stride
+        self.batch_size = batch_size
+        self.current_frame = 0
+
         if any(videos):
             self._new_video(videos[0])  # new video
         else:
@@ -276,42 +279,64 @@ class LoadImages:
     def __next__(self):
         if self.count == self.nf:
             raise StopIteration
-        path = self.files[self.count]
 
         if self.video_flag[self.count]:
-            # Read video
+            # Batch Video Mode
             self.mode = 'video'
-            for _ in range(self.vid_stride):
-                self.cap.grab()
-            ret_val, im0 = self.cap.retrieve()
-            while not ret_val:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                path = self.files[self.count]
-                self._new_video(path)
-                ret_val, im0 = self.cap.read()
+            imgs, im0s, paths, caps, texts = [], [], [], [], []
+            path = self.files[self.count]
 
-            self.frame += 1
-            # im0 = self._cv2_rotate(im0)  # for use if cv2 autorotation is False
-            s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
+            for _ in range(self.batch_size):
+                for _ in range(self.vid_stride):
+                    self.cap.grab()
+                ret_val, im0 = self.cap.retrieve()
+                if not ret_val:
+                    self.count += 1
+                    self.cap.release()
+                    if self.count == self.nf:
+                        break
+                    path = self.files[self.count]
+                    self._new_video(path)
+                    ret_val, im0 = self.cap.read()
+                    if not ret_val:
+                        break
+                self.frame += 1
+                s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
+
+                if self.transforms:
+                    im = self.transforms(im0)
+                else:
+                    im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+                    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                    im = np.ascontiguousarray(im)
+
+                imgs.append(im)
+                im0s.append(im0)
+                paths.append(path)
+                caps.append(self.cap)
+                texts.append(s)
+
+            if not imgs:
+                raise StopIteration
+
+            return paths, imgs, im0s, caps, texts
 
         else:
-            # Read image
+            # Image Mode
+            path = self.files[self.count]
             self.count += 1
             im0 = cv2.imread(path)  # BGR
             assert im0 is not None, f'Image Not Found {path}'
             s = f'image {self.count}/{self.nf} {path}: '
 
-        if self.transforms:
-            im = self.transforms(im0)  # transforms
-        else:
-            im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]  # padded resize
-            im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-            im = np.ascontiguousarray(im)  # contiguous
+            if self.transforms:
+                im = self.transforms(im0)
+            else:
+                im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]  # padded resize
+                im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                im = np.ascontiguousarray(im)  # contiguous
 
-        return path, im, im0, self.cap, s
+            return path, im, im0, self.cap, s
 
     def _new_video(self, path):
         # Create a new video capture object
@@ -319,7 +344,7 @@ class LoadImages:
         self.cap = cv2.VideoCapture(path)
         self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
         self.orientation = int(self.cap.get(cv2.CAP_PROP_ORIENTATION_META))  # rotation degrees
-        # self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)  # disable https://github.com/ultralytics/yolov5/issues/8493
+        # self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
 
     def _cv2_rotate(self, im):
         # Rotate a cv2 video manually
@@ -333,6 +358,7 @@ class LoadImages:
 
     def __len__(self):
         return self.nf  # number of files
+
 
 
 class LoadStreams:
