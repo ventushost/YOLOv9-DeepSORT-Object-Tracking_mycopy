@@ -127,6 +127,7 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
     model.warmup(imgsz=(1 if pt or model.triton else det_batch, 3, *imgsz))
 
     detections = []
+    CSV_BATCH_SIZE = 5000
     LOG.info("Laufe durch Frames …")
 
     total_frames = getattr(dataset, 'nframes', None)
@@ -189,7 +190,7 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
                 det[:, :4] = scale_boxes(im_tensor.shape[2:], det[:, :4], im0.shape).round()
                 for *xyxy, conf, cls in det:
                     x1, y1, x2, y2 = map(int, xyxy)
-                    detections.append({
+                    detections_batch.append({
                         'video_name': p.name,
                         'frame': int(frame_idx),
                         'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
@@ -201,6 +202,13 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
                         'frame_width': im0.shape[1],
                         'frame_height': im0.shape[0]
                     })
+                    
+                # Batch-weise CSV-Schreiben
+                if len(detections_batch) >= CSV_BATCH_SIZE:
+                    df_tmp = pd.DataFrame(detections_batch)
+                    df_tmp.to_csv(out_csv, mode='a', index=False, header=not Path(out_csv).exists())
+                    detections_batch.clear()
+
 
             frames_done += 1
             if frames_done % tqdm_update == 0:
