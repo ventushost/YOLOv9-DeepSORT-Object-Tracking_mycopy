@@ -96,9 +96,14 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
     if is_url and is_file:
         source = check_file(source)
 
+    # Direkt in Google Drive speichern
+    project = "/content/drive/MyDrive/FREUNDE_Messebau/FREUNDE_Messetracking/ergebnisse/live_export"
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)
     save_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = save_dir / 'detections.csv'
     LOG.info(f"Output-Verzeichnis: {save_dir}")
+
+
 
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
@@ -143,7 +148,7 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
     if profile and use_cuda:
         ev_fwd_s = torch.cuda.Event(enable_timing=True)
         ev_fwd_e = torch.cuda.Event(enable_timing=True)
-
+    detections_batch = []
     for paths, ims, im0s, vid_caps, texts in dataset:
         bs_act = len(paths)
         # H2D copy
@@ -239,10 +244,12 @@ def run(weights, source, data, imgsz, conf_thres, iou_thres, max_det, device, ag
         LOG.info(f"  NMS:        {t_nms:6.3f}s ({pct(t_nms):5.1f}%)")
         LOG.info(f"  Postproc:   {t_post:6.3f}s ({pct(t_post):5.1f}%)")
 
-    # CSV speichern
-    df = pd.DataFrame(detections)
-    out_csv = save_dir / 'detections.csv'
-    df.to_csv(out_csv, index=False)
+    # Falls am Ende noch nicht gespeicherte Detections im Batch sind, speichere sie jetzt
+    if detections_batch:
+        df_tmp = pd.DataFrame(detections_batch)
+        df_tmp.to_csv(out_csv, mode='a', index=False, header=not Path(out_csv).exists())
+        detections_batch.clear()
+
     LOG.info(f"Detections gespeichert: {out_csv}")
     LOG.info("Fertig.")
 
