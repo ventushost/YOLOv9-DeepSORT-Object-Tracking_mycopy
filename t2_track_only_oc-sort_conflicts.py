@@ -1,20 +1,29 @@
 import pandas as pd
 import numpy as np
+import argparse
 
-# Eingabedatei vom Tracking
-INPUT_TRACKED_CSV = 'ocsort_tracked.csv'
-OUTPUT_CONFLICT_CSV = 'ocsort_conflicts.csv'
+# Argumente parsen
+parser = argparse.ArgumentParser(description="Konfliktanalyse von Tracking-Daten")
+parser.add_argument('--input', type=str, required=True, help='Pfad zur getrackten CSV-Datei')
+parser.add_argument('--output', type=str, default='ocsort_conflicts.csv', help='Pfad zur Ausgabedatei für Konflikte')
+parser.add_argument('--iou_thresh', type=float, default=0.3, help='IoU-Schwellenwert')
+parser.add_argument('--dist_thresh', type=float, default=50, help='Distanzschwelle für Nähe')
+parser.add_argument('--gap_thresh', type=int, default=3, help='Maximal erlaubte Frame-Lücke')
+parser.add_argument('--margin', type=int, default=20, help='Bildrand-Marge')
+args = parser.parse_args()
 
 # Parameter
-IOU_THRESH = 0.3
-DIST_THRESH = 50
-GAP_THRESH = 3
-MARGIN = 20
+INPUT_TRACKED_CSV = args.input
+OUTPUT_CONFLICT_CSV = args.output
+IOU_THRESH = args.iou_thresh
+DIST_THRESH = args.dist_thresh
+GAP_THRESH = args.gap_thresh
+MARGIN = args.margin
 
-# Lade Trackingdaten
+# Trackingdaten laden
 df = pd.read_csv(INPUT_TRACKED_CSV)
 
-# Falls nötig: Bildgröße bestimmen
+# Bildgröße bestimmen (Fallback auf FullHD)
 W = int(df['frame_width'].iloc[0]) if 'frame_width' in df.columns else 1920
 H = int(df['frame_height'].iloc[0]) if 'frame_height' in df.columns else 1080
 
@@ -64,7 +73,7 @@ for track_id, sub in df.groupby('track_id'):
                 row.x2 < W - MARGIN and row.y2 < H - MARGIN):
                 conflict_indices.add(row.name)
 
-# Speichern
+# Konflikte speichern
 df_conflicts = df.loc[sorted(conflict_indices)]
 df_conflicts.to_csv(OUTPUT_CONFLICT_CSV, index=False)
 
