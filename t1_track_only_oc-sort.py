@@ -3,20 +3,32 @@ import numpy as np
 from ocsort.ocsort import OCSort
 import torch
 from pathlib import Path
+import argparse
 
-# Dateipfade
-INPUT_CSV = 'detections-3.csv'
-OUTPUT_OCSORT_CSV = 'ocsort_tracked.csv'
-BATCH_SIZE = 1000
+# Argumente einlesen
+parser = argparse.ArgumentParser(description="OCSort Tracking für Excel-Datei")
+parser.add_argument('--input', type=str, required=True, help='Pfad zur Eingabe-Excel- oder CSV-Datei')
+parser.add_argument('--output', type=str, default='ocsort_tracked.csv', help='Pfad zur Ausgabedatei (CSV)')
+parser.add_argument('--batch', type=int, default=1000, help='Batch-Größe für Zwischenspeicherung')
+args = parser.parse_args()
 
-# Load detections
-df = pd.read_csv(INPUT_CSV)
+INPUT_CSV = args.input
+OUTPUT_OCSORT_CSV = args.output
+BATCH_SIZE = args.batch
 
-# Initialize OC-SORT tracker
+# Datei laden
+if INPUT_CSV.endswith('.csv'):
+    df = pd.read_csv(INPUT_CSV)
+elif INPUT_CSV.endswith(('.xls', '.xlsx')):
+    df = pd.read_excel(INPUT_CSV)
+else:
+    raise ValueError("Dateiformat nicht unterstützt. Bitte CSV oder Excel angeben.")
+
+# Tracker initialisieren
 tracker = OCSort()
 tracked_rows = []
 
-# Flag, um zu prüfen ob Header schon geschrieben wurde
+# Header-Check
 header_written = Path(OUTPUT_OCSORT_CSV).exists()
 
 # IoU-Funktion
@@ -31,7 +43,7 @@ def iou(box1, box2):
     union = area1 + area2 - inter_area
     return inter_area / (union + 1e-6)
 
-# Pro Frame tracken
+# Tracking pro Frame
 for frame_id, group in df.groupby('frame'):
     dets = []
     meta = []
@@ -69,16 +81,16 @@ for frame_id, group in df.groupby('frame'):
         if best_match:
             tracked_rows.append({**best_match, 'track_id': int(track_id)})
 
-    # Batch speichern
     if len(tracked_rows) >= BATCH_SIZE:
         df_tmp = pd.DataFrame(tracked_rows)
         df_tmp.to_csv(OUTPUT_OCSORT_CSV, mode='a', index=False, header=not header_written)
         header_written = True
         tracked_rows.clear()
 
-# Letzten Rest speichern
+# Rest speichern
 if tracked_rows:
     df_tmp = pd.DataFrame(tracked_rows)
     df_tmp.to_csv(OUTPUT_OCSORT_CSV, mode='a', index=False, header=not header_written)
 
 print(f"✅ Fertig: {OUTPUT_OCSORT_CSV} mit kontinuierlichem Schreiben.")
+
