@@ -1,260 +1,227 @@
-#!/usr/bin/env python3
-import os
-import sys
-import logging
-import argparse
-import traceback
-import time
-import threading
-import queue
-from pathlib import Path
-
-import torch
-import pandas as pd
 import numpy as np
-from tqdm.auto import tqdm
-try:
-    from decord import VideoReader, cpu
-except ImportError:
-    logging.basicConfig(level=logging.ERROR)
-    LOG = logging.getLogger("deep_sort")
-    LOG.error("Required library 'decord' not found. Install it via 'pip install decord' and retry.")
-    sys.exit(1)
-
-# Fix deprecated numpy aliases
+# Legacy numpy compatibility
 if not hasattr(np, 'float'):
     np.float = float
 if not hasattr(np, 'int'):
     np.int = int
 
-# Setup logging
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
+import cv2
+import os
+import subprocess
+import torch
+import pandas as pd
+import gc
+import argparse
+import sys
+from pathlib import Path
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# === Logging konfigurieren ===
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)5s] %(message)s",
-    datefmt="%H:%M:%S"
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-LOG = logging.getLogger("deep_sort")
 
-# === Argparser ===
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="DeepSORT Tracking mit Loader- und Consumer-Threads"
-    )
-    parser.add_argument("-d", "--deepsort-path", required=True,
-                        help="Pfad zum YOLOv9-DeepSORT-Object-Tracking-Repo")
-    parser.add_argument("-v", "--video", required=True,
-                        help="Pfad oder URL zur Videodatei")
-    parser.add_argument("-c", "--context-csv", required=True,
-                        help="Pfad zur Context-CSV")
-    parser.add_argument("-s", "--start-ids-csv", required=True,
-                        help="Pfad zur Start-IDs-CSV")
-    parser.add_argument("-o", "--output-csv", required=True,
-                        help="Pfad zur Ausgabe-CSV")
-    parser.add_argument("-g", "--frame-gap", type=int, default=10,
-                        help="Maximaler Frame-Abstand für Batches")
-    parser.add_argument("--half", action="store_true",
-                        help="FP16 für ReID-Modell nutzen, falls möglich")
-    parser.add_argument("--compile", dest="compile_model", action="store_true",
-                        help="torch.compile auf update() anwenden")
-    parser.add_argument("--profile", action="store_true",
-                        help="Profiling der Update-Zeiten aktivieren")
-    parser.add_argument("--tqdm-update", type=int, default=20,
-                        help="tqdm-Update-Intervall")
-    parser.add_argument("--expected-fps", type=float, default=None,
-                        help="Erwartete Framerate prüfen (Warnung bei Abweichung)")
-    parser.add_argument("--mem-cap-gb", type=float, default=10.0,
-                        help="Maximaler Speicher für Frames und Context in GB")
-    return parser.parse_args()
 
-# === DeepSORT factory ===
-def make_deepsort(repo_path, half=False, compile_model=False):
-    from deep_sort_pytorch.deep_sort.deep_sort import DeepSort
-    ckpt = os.path.join(repo_path, "deep_sort_pytorch/deep_sort/deep/checkpoint/ckpt.t7")
-    ds = DeepSort(
-        model_path=ckpt,
-        max_dist=0.2, min_confidence=0.3, nms_max_overlap=0.5,
-        max_iou_distance=0.7, max_age=70, n_init=3, nn_budget=100,
-        use_cuda=torch.cuda.is_available()
-    )
-    if half:
-        try:
-            ds.model = ds.model.half()
-            LOG.info("DeepSort ReID model auf FP16 umgestellt")
-        except Exception:
-            LOG.warning("FP16-Konvertierung fehlgeschlagen")
-    if compile_model:
-        try:
-            ds.update = torch.compile(ds.update, mode="reduce-overhead")
-            LOG.info("torch.compile auf DeepSort.update angewendet")
-        except Exception as e:
-            LOG.warning(f"torch.compile fehlgeschlagen: {e}")
-    return ds
+def process_single_batch(task_args):
+    """
+    Worker-Funktion für parallele Batch-Verarbeitung.
+    task_args: Tuple mit (idx, batch, DEEPSORT_PATH, VIDEO_PATH, CONTEXT_CSV, ds_params, fps)
+    """
+    idx, batch, DEEPSORT_PATH, VIDEO_PATH, CONTEXT_CSV, START_IDS_CSV, ds_params, fps = task_args
+    logging.info("Worker startet Batch %d: Frames %d bis %d", idx, batch[0], batch[-1])
 
-# === Batch Buffer Loader ===
-class BatchLoader:
-    def __init__(self, batches, vr, context_df, mem_cap_bytes):
-        self.batches = batches
-        self.vr = vr
-        self.context_df = context_df
-        self.mem_cap = mem_cap_bytes
-        self.current_mem = 0
-        self.queue = queue.Queue()
-        self.lock = threading.Condition()
-        self.finished = False
-        # start thread
-        self.thread = threading.Thread(target=self._load_batches, daemon=True)
-        self.thread.start()
+    # CSV nur für diesen Worker laden
+    context_df = pd.read_csv(CONTEXT_CSV)
 
-    def _load_batches(self):
-        for batch in self.batches:
-            idxs = np.array(batch, dtype=np.int32) - 1
-            frames = self.vr.get_batch(idxs).asnumpy()
-            ctx = self.context_df[self.context_df['frame'].isin(batch)].copy()
-            # estimate memory
-            size = frames.nbytes + ctx.memory_usage(deep=True).sum()
-            with self.lock:
-                while self.current_mem + size > self.mem_cap:
-                    self.lock.wait(timeout=0.1)
-                # enqueue
-                self.queue.put((batch, frames, ctx))
-                self.current_mem += size
-        with self.lock:
-            self.finished = True
-            self.lock.notify_all()
+    start_f, end_f = batch[0], batch[-1]
+    start_s = start_f / fps
+    duration_s = (end_f - start_f + 1) / fps
+    clip_file = f"temp_batch_{idx}.mp4"
 
-    def get_batch(self, timeout=None):
-        try:
-            return self.queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+    # 1) Clip mit FFmpeg extrahieren
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_s),
+        "-i", VIDEO_PATH,
+        "-t", str(duration_s),
+        "-c", "copy",
+        clip_file
+    ]
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    logging.info("Worker Batch %d: Clip erstellt (%s)", idx, clip_file)
 
-    def batch_done(self, batch, frames, ctx):
-        # free memory
-        size = frames.nbytes + ctx.memory_usage(deep=True).sum()
-        with self.lock:
-            self.current_mem -= size
-            self.lock.notify_all()
+    # 2) Neuer Tracker instanziieren
+    sys.path.append(str(Path(DEEPSORT_PATH) / "deep_sort_pytorch"))
+    from deep_sort_pytorch.deep_sort import DeepSort
+    deepsort = DeepSort(**ds_params)
 
-    def has_more(self):
-        with self.lock:
-            return not (self.finished and self.queue.empty())
+    # 3) Clip frameweise tracken
+    cap = cv2.VideoCapture(clip_file)
+    batch_out = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        idx_seg = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        abs_frame = start_f + idx_seg
 
-# === Main ===
+        dets = context_df[context_df['frame'] == abs_frame]
+        if dets.empty:
+            continue
+
+        bbox_xywh, confs = [], []
+        for _, r in dets.iterrows():
+            x1, y1, x2, y2 = r[['x1','y1','x2','y2']]
+            w, h = x2 - x1, y2 - y1
+            bbox_xywh.append([x1 + w/2, y1 + h/2, w, h])
+            confs.append(r['conf'])
+
+        if not bbox_xywh:
+            continue
+
+        outs = deepsort.update(
+            torch.Tensor(bbox_xywh),
+            torch.Tensor(confs),
+            [0] * len(bbox_xywh),
+            frame
+        )
+        for x1, y1, x2, y2, tid, cls in outs:
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            batch_out.append({
+                'frame': abs_frame,
+                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                'conf': 1.0, 'cls': cls, 'timestamp': '',
+                'original_index': '', 'track_id': tid,
+                'cx': cx, 'cy': cy
+            })
+    cap.release()
+    os.remove(clip_file)
+    logging.info("Worker Batch %d: Clip gelöscht", idx)
+
+    # Speicher freigeben
+    del context_df
+    gc.collect()
+
+    # === Korrektur der IDs aus start_ids_csv ===
+    start_ids_df = pd.read_csv(START_IDS_CSV)
+
+    first_frame_num = batch[0]
+    batch_out_df = pd.DataFrame(batch_out)
+
+    first_frame_detections = batch_out_df[batch_out_df['frame'] == first_frame_num]
+
+    for _, det in first_frame_detections.iterrows():
+        cx, cy, assigned_tid = det['cx'], det['cy'], det['track_id']
+        candidates = start_ids_df[start_ids_df['frame'] == first_frame_num]
+        if candidates.empty:
+            continue
+        candidates['distance'] = np.sqrt((candidates['cx'] - cx)**2 + (candidates['cy'] - cy)**2)
+        closest_match = candidates.loc[candidates['distance'].idxmin()]
+        if closest_match['distance'] < 10:
+            correct_tid = closest_match['track_id']
+            batch_out_df.loc[batch_out_df['track_id'] == assigned_tid, 'track_id'] = correct_tid
+
+    batch_out = batch_out_df.to_dict(orient='records')
+
+
+    return idx, batch_out
+
+
 def main():
-    args = parse_args()
-    logging.getLogger().setLevel(logging.DEBUG)
-    LOG.info("=== Script Start ===")
+    parser = argparse.ArgumentParser(
+        description="DeepSORT-Tracking in Chunks via FFmpeg mit parallel Processing"
+    )
+    parser.add_argument("--deepsort-path", type=str, required=True, help="Pfad zum lokalen DeepSORT-Repository")
+    parser.add_argument("--video", type=str, required=True, help="Pfad zum Eingabe-Video")
+    parser.add_argument("--context-csv", type=str, required=True, help="CSV mit vorverarbeiteten Detektionen")
+    parser.add_argument("--start-ids-csv", type=str, required=True, help="CSV mit Start-Track-IDs")
+    parser.add_argument("--output-csv", type=str, required=True, help="Ziel-CSV für die Tracking-Ergebnisse")
+    parser.add_argument("--frame-gap-threshold", type=int, default=10, help="Maximaler Frame-Abstand für Batch-Bildung")
+    parser.add_argument("--workers", type=int, default=10, help="Anzahl paralleler Worker")
+    args = parser.parse_args()
 
-    # Prepare DeepSORT imports
-    ds_root = Path(args.deepsort_path) / "deep_sort_pytorch"
-    sys.path.append(str(ds_root))
-    from deep_sort_pytorch.deep_sort.deep_sort import DeepSort
-    from deep_sort_pytorch.deep_sort.sort.tracker import Tracker
+    DEEPSORT_PATH = args.deepsort_path
+    VIDEO_PATH = args.video
+    CONTEXT_CSV = args.context_csv
+    START_IDS_CSV = args.start_ids_csv
+    OUTPUT_CSV = args.output_csv
+    FRAME_GAP_THRESHOLD = args.frame_gap_threshold
+    NUM_WORKERS = args.workers
 
-    # Load CSVs once
-    t0 = time.time()
-    context_df = pd.read_csv(args.context_csv)
-    start_ids_df = pd.read_csv(args.start_ids_csv)
-    LOG.info(f"CSV geladen in {time.time()-t0:.2f}s: context={len(context_df)}, start_ids={len(start_ids_df)}")
+    logging.info("Starte paralleles Tracking mit Video: %s und %d Worker", VIDEO_PATH, NUM_WORKERS)
 
-    # Compute batches
-    frames = sorted(context_df['frame'].unique())
+    # CSVs einlesen / Batches bilden
+    context_df = pd.read_csv(CONTEXT_CSV)
+    frames = context_df['frame'].sort_values().unique()
     batches, curr, last = [], [], None
     for f in frames:
-        if last is None or f - last <= args.frame_gap:
+        if last is None or f - last <= FRAME_GAP_THRESHOLD:
             curr.append(f)
         else:
-            batches.append(curr); curr=[f]
+            batches.append(curr)
+            curr = [f]
         last = f
-    if curr: batches.append(curr)
-    LOG.info(f"{len(batches)} Batches erstellt (gap≤{args.frame_gap})")
+    if curr:
+        batches.append(curr)
+    logging.info("Insgesamt %d Batches erstellt", len(batches))
 
-    # Open VideoReader
-    vr = VideoReader(args.video, ctx=cpu(0), num_threads=4)
-    total_frames = len(vr)
-    LOG.info(f"Video geöffnet: total_frames={total_frames}")
+    # FPS bestimmen
+    cap_probe = cv2.VideoCapture(VIDEO_PATH)
+    fps = cap_probe.get(cv2.CAP_PROP_FPS)
+    cap_probe.release()
+    logging.info("Video-FPS: %.2f", fps)
 
-    # FPS check
-    actual_fps = vr.get_avg_fps()
-    LOG.info(f"Detected video FPS: {actual_fps:.2f}")
-    if args.expected_fps and abs(actual_fps - args.expected_fps)>0.1:
-        LOG.warning(f"Erwartete FPS {args.expected_fps}, aber {actual_fps:.2f} erkannt.")
+    # DeepSORT Parameter
+    ds_params = {
+        "model_path": os.path.join(
+            DEEPSORT_PATH,
+            "deep_sort_pytorch/deep_sort/deep/checkpoint/ckpt.t7"
+        ),
+        "max_dist": 0.2,
+        "min_confidence": 0.3,
+        "nms_max_overlap": 0.5,
+        "max_iou_distance": 0.7,
+        "max_age": 70,
+        "n_init": 3,
+        "nn_budget": 100,
+        "use_cuda": torch.cuda.is_available()
+    }
 
-    # Start batch loader
-    mem_cap = int(args.mem_cap_gb * 1024**3)
-    loader = BatchLoader(batches, vr, context_df, mem_cap)
+    # Output CSV initialisieren
+    if os.path.exists(OUTPUT_CSV):
+        os.remove(OUTPUT_CSV)
+        logging.info("Vorhandene Output-CSV entfernt: %s", OUTPUT_CSV)
+    cols = ["frame","x1","y1","x2","y2","conf","cls",
+            "timestamp","original_index","track_id","cx","cy"]
+    pd.DataFrame(columns=cols).to_csv(OUTPUT_CSV, index=False)
+    logging.info("Output-CSV initialisiert: %s", OUTPUT_CSV)
 
-    # Instantiate DeepSort
-    deepsort = make_deepsort(args.deepsort_path, half=args.half, compile_model=args.compile_model)
+    # Aufgabenliste vorbereiten
+    tasks = [
+        (idx, batch, DEEPSORT_PATH, VIDEO_PATH, CONTEXT_CSV, START_IDS_CSV, ds_params, fps)
+        for idx, batch in enumerate(batches, start=1)
+    ]
 
-    # Prepare output CSV writer
-    out_f = open(args.output_csv, 'w', buffering=1)
-    header = 'frame,x1,y1,x2,y2,conf,cls,track_id' + '\n'
-    out_f.write(header)
 
-        # Compute total frames across all batches for progress
-    total_batch_frames = sum(len(batch) for batch in batches)
-    LOG.info(f"Total frames to process (all batches): {total_batch_frames}")
-    # Progress bar over total batch frames
-    pbar = tqdm(total=total_batch_frames, desc='Batch 1/{}'.format(len(batches)), unit='frame', miniters=args.tqdm_update, dynamic_ncols=True)
-    pbar = tqdm(total=total_batch_frames, desc=f'Batch 1/{len(batches)}', unit='frame', miniters=args.tqdm_update, dynamic_ncols=True)
-    update_times = []
+    # Paralleles Tracking starten
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {executor.submit(process_single_batch, t): t[0] for t in tasks}
+        for fut in as_completed(futures):
+            idx, batch_out = fut.result()
+            if batch_out:
+                pd.DataFrame(batch_out).to_csv(OUTPUT_CSV, mode='a', header=False, index=False)
+                logging.info("Batch %d: %d Zeilen zu CSV hinzugefügt", idx, len(batch_out))
 
-        # Consumer loop
-    processed_frames = 0
-    while loader.has_more():
-        item = loader.get_batch(timeout=1.0)
-        if item is None:
-            continue
-        batch, frames_arr, ctx = item
-        bi = batches.index(batch) + 1
-        LOG.info(f"--- Consuming Batch {bi}/{len(batches)}: Frames {batch[0]}–{batch[-1]} ({len(batch)}) ---")
-        # reset tracker
-        deepsort.tracker = Tracker(
-            metric=deepsort.tracker.metric,
-            max_iou_distance=deepsort.tracker.max_iou_distance,
-            max_age=deepsort.tracker.max_age,
-            n_init=deepsort.tracker.n_init
-        )
-        # process frames
-        for fn, frame in zip(batch, frames_arr):
-            # Update progress bar description for current batch
-            pbar.set_description(f"Batch {bi}/{len(batches)}")
-            # process detections
-            ...
-            pbar.update(1)
-            processed_frames += 1
-            processed_frames += 1
-            processed_frames += 1
-            continue
-            arr = dets[['x1','y1','x2','y2','conf']].values
-            xy1 = arr[:,:2]; wh = arr[:,2:4] - xy1; centers = xy1 + wh/2
-            bbox_xywh = torch.from_numpy(np.hstack((centers, wh)))
-            confs = torch.from_numpy(arr[:,4])
-            t1 = time.time()
-            with torch.no_grad():
-                outs = deepsort.update(bbox_xywh, confs, [0]*len(dets), frame)
-            if args.profile:
-                update_times.append(time.time()-t1)
-            for x1,y1,x2,y2,tid,cls in outs:
-                out_f.write(f"{fn},{x1},{y1},{x2},{y2},1.0,{cls},{tid}\n")
-            pbar.update(1)
-            processed_frames += 1
-        # batch done, free memory
-        loader.batch_done(batch, frames_arr, ctx)
-        LOG.info(f"Overall progress: {processed_frames}/{total_batch_frames} frames ({processed_frames/total_batch_frames:.2%})")
+    logging.info("Paralleles Tracking abgeschlossen. Ergebnisse in %s", OUTPUT_CSV)
 
-    pbar.close(); out_f.close()
-    if args.profile and update_times:
-        avg = sum(update_times)/len(update_times)
-        LOG.info(f"Update calls: {len(update_times)}, avg time: {avg:.4f}s")
-    LOG.info("Processing complete.")
 
-if __name__=='__main__':
-    try: main()
-    except Exception:
-        LOG.error("Unhandled error:\n"+traceback.format_exc())
-        sys.exit(1)
-
+if __name__ == '__main__':
+    main()
 
 
